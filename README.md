@@ -37,7 +37,7 @@ $ pip install -r requirement.txt
 Follow the instructions in [prepare_datasets.md](data_preprocessing/prepare_datasets.md) to preprocess the dataset.
 
 ### Pretrained Model
-- We've provided the pretrained weights used for our paper's experiments. You can download these weights <a href="https://drive.google.com/drive/folders/1tx1cvJ2kFtmyvKRpbG29l-qwHBGk9qj0">here</a>.  <br /><br />
+- We've provided the pretrained weights used for our paper's experiments. You can download these weights <a href="https://huggingface.co/KAISTEdlab/PerX2CT">here</a>.  <br /><br />
 
 ## Training
 To train PerX2CT, run `main.py` with the hyper-parameters provided below:
@@ -87,7 +87,7 @@ We thank the authors for their open-sourced code. <br /><br />
 
 ## Citation
 ```
-@INPROCEEDINGS{10096296,
+@INPROCEEDINGS{kyung2023perx2ct,
   author={Kyung, Daeun and Jo, Kyungmin and Choo, Jaegul and Lee, Joonseok and Choi, Edward},
   booktitle={ICASSP 2023 - 2023 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)}, 
   title={Perspective Projection-Based 3d CT Reconstruction from Biplanar X-Rays}, 
