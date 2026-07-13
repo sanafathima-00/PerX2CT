@@ -91,27 +91,36 @@ class INRAEZoomModel(AEModel):
             h['outputs'] = self.quant_conv(h['outputs'])
         return h
 
-    def training_step(self, batch, batch_idx, optimizer_idx):
+    def training_step(self, batch, batch_idx):
         batch = self.get_input(batch)
         batch['image_key'] = self.image_key
+        opt_ae, opt_disc = self.optimizers()
+
+        # autoencode (generator) -- independent forward pass, as before
+        self.toggle_optimizer(opt_ae)
         xrec_dict, x = self(batch)
-
         qloss = torch.zeros(len(x), 1).to(self.device)
-        if optimizer_idx == 0:
-            # autoencode
-            aeloss, log_dict_ae = self.loss(qloss, x, xrec_dict, optimizer_idx, self.global_step,
-                                            last_layer=self.get_last_layer(), split="train")
-            log_dict_ae['train/psnr'] = self.psnr(xrec_dict["outputs"], x)
-            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-            self.print_loss(log_dict_ae)
-            return aeloss
+        aeloss, log_dict_ae = self.loss(qloss, x, xrec_dict, 0, self.global_step,
+                                        last_layer=self.get_last_layer(), split="train")
+        log_dict_ae['train/psnr'] = self.psnr(xrec_dict["outputs"], x)
+        self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+        self.print_loss(log_dict_ae)
+        opt_ae.zero_grad()
+        self.manual_backward(aeloss)
+        opt_ae.step()
+        self.untoggle_optimizer(opt_ae)
 
-        if optimizer_idx == 1:
-            # discriminator
-            discloss, log_dict_disc = self.loss(qloss, x, xrec_dict, optimizer_idx, self.global_step,
-                                                last_layer=self.get_last_layer(), split="train")
-            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-            return discloss
+        # discriminator -- independent forward pass, as before
+        self.toggle_optimizer(opt_disc)
+        xrec_dict, x = self(batch)
+        qloss = torch.zeros(len(x), 1).to(self.device)
+        discloss, log_dict_disc = self.loss(qloss, x, xrec_dict, 1, self.global_step,
+                                            last_layer=self.get_last_layer(), split="train")
+        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+        opt_disc.zero_grad()
+        self.manual_backward(discloss)
+        opt_disc.step()
+        self.untoggle_optimizer(opt_disc)
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):

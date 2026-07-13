@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from importlib import import_module
-from pytorch_lightning.utilities.distributed import rank_zero_only
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
 import torchvision.transforms as transforms
 import pdb
 
@@ -32,6 +32,7 @@ class AEModel(pl.LightningModule):
                  metadata={},
                  ):
         super().__init__()
+        self.automatic_optimization = False
         self.metadata = metadata
         self.image_key = image_key
         self.print_loss_per_step = self.metadata.get('print_loss_per_step', 50)
@@ -122,28 +123,37 @@ class AEModel(pl.LightningModule):
             losses = f"[{split} Step{self.global_step}] : {losses[2:]}"
             print(f"{losses}")
 
-    def training_step(self, batch, batch_idx, optimizer_idx):
+    def training_step(self, batch, batch_idx):
         x = self.get_input(batch, self.image_key)
+        opt_ae, opt_disc = self.optimizers()
+
+        # autoencode (generator) -- independent forward pass, as before
+        self.toggle_optimizer(opt_ae)
         qloss = torch.zeros(len(x), 1).to(self.device)
         xrec_dict = self(x)
+        aeloss, log_dict_ae = self.loss(qloss, x, xrec_dict, 0, self.global_step,
+                                        last_layer=self.get_last_layer(), split="train")
+        log_dict_ae['train/psnr'] = self.psnr(xrec_dict["outputs"], x)
+        self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=False)
+        self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+        self.print_loss(log_dict_ae)
+        opt_ae.zero_grad()
+        self.manual_backward(aeloss)
+        opt_ae.step()
+        self.untoggle_optimizer(opt_ae)
 
-        if optimizer_idx == 0:
-            # autoencode
-            aeloss, log_dict_ae = self.loss(qloss, x, xrec_dict, optimizer_idx, self.global_step,
+        # discriminator -- independent forward pass, as before
+        self.toggle_optimizer(opt_disc)
+        qloss = torch.zeros(len(x), 1).to(self.device)
+        xrec_dict = self(x)
+        discloss, log_dict_disc = self.loss(qloss, x, xrec_dict, 1, self.global_step,
                                             last_layer=self.get_last_layer(), split="train")
-            log_dict_ae['train/psnr'] = self.psnr(xrec_dict["outputs"], x)
-            self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=False)
-            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-            self.print_loss(log_dict_ae)
-            return aeloss
-
-        if optimizer_idx == 1:
-            # discriminator
-            discloss, log_dict_disc = self.loss(qloss, x, xrec_dict, optimizer_idx, self.global_step,
-                                                last_layer=self.get_last_layer(), split="train")
-            self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=False)
-            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-            return discloss
+        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=False)
+        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+        opt_disc.zero_grad()
+        self.manual_backward(discloss)
+        opt_disc.step()
+        self.untoggle_optimizer(opt_disc)
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):

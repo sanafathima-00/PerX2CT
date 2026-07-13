@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from importlib import import_module
-from pytorch_lightning.utilities.distributed import rank_zero_only
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
 import pdb
 
 from main import instantiate_from_config

@@ -1,0 +1,33 @@
+# Patient/clinical data -- never commit (see data-governance note; contains
+# real, patient-identifiable DICOM exports)
+sample_data/
+
+# Preprocessed / raw datasets (LIDC-IDRI and similar) -- large binary data,
+# not source
+data/
+data_preprocessing/lidc_idri/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Training/eval run artifacts
+logs/
+wandb/
+checkpoints/
+*.ckpt
+
+# Editor / OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local environment/secrets
+.env

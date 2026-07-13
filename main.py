@@ -15,7 +15,7 @@ from omegaconf import OmegaConf
 from taming.data.utils import custom_collate
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
-from pytorch_lightning.utilities.distributed import rank_zero_only
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
 from torch.utils.data import DataLoader, Dataset
 
@@ -115,15 +115,14 @@ def get_parser(**parser_kwargs):
     parser.add_argument("--wandb_project", type=str, default="PerX2CT")
     parser.add_argument("--wandb_tags", nargs="+", default=[])
     parser.add_argument("--save_epoch_frequency", type=int, default=None)
+    parser.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help='comma-separated GPU ids to train on (e.g. "0," or "0,1"); omit for CPU',
+    )
 
     return parser
-
-
-def nondefault_trainer_args(opt):
-    parser = argparse.ArgumentParser()
-    parser = Trainer.add_argparse_args(parser)
-    args = parser.parse_args([])
-    return sorted(k for k in vars(args) if getattr(opt, k) != getattr(args, k))
 
 
 def instantiate_from_config(config):
@@ -214,7 +213,7 @@ class SetupCallback(Callback):
         self.config = config
         self.lightning_config = lightning_config
 
-    def on_pretrain_routine_start(self, trainer, pl_module):
+    def on_fit_start(self, trainer, pl_module):
         if trainer.global_rank == 0:
             update_config = OmegaConf.to_container(self.config, resolve=True)
             wandb.config.update(update_config, allow_val_change=True)
@@ -224,12 +223,12 @@ class SetupCallback(Callback):
             os.makedirs(self.cfgdir, exist_ok=True)
 
             print("Project config")
-            print(self.config.pretty())
+            print(OmegaConf.to_yaml(self.config))
             OmegaConf.save(self.config,
                            os.path.join(self.cfgdir, "{}-project.yaml".format(self.now)))
             print("========================================\n")
             print("Lightning config")
-            print(self.lightning_config.pretty())
+            print(OmegaConf.to_yaml(self.lightning_config))
             OmegaConf.save(OmegaConf.create({"lightning": self.lightning_config}),
                            os.path.join(self.cfgdir, "{}-lightning.yaml".format(self.now)))
             print("========================================\n")
@@ -288,7 +287,6 @@ class ImageLogger(Callback):
         self.max_images = max_images
         self.logger_log_images = {
             pl.loggers.WandbLogger: self._wandb,
-            pl.loggers.TestTubeLogger: self._testtube,
         }
         self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
@@ -411,7 +409,6 @@ if __name__ == "__main__":
     sys.path.append(os.getcwd())
 
     parser = get_parser()
-    parser = Trainer.add_argparse_args(parser)
 
     opt, unknown = parser.parse_known_args()
     
@@ -474,20 +471,24 @@ if __name__ == "__main__":
         lightning_config = config.pop("lightning", OmegaConf.create())
         # merge trainer cli with config
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
-        # default to ddp
-        trainer_config["distributed_backend"] = "ddp"
-        for k in nondefault_trainer_args(opt):
-            trainer_config[k] = getattr(opt, k)
-        if not "gpus" in trainer_config:
-            del trainer_config["distributed_backend"]
-            cpu = True
-        else:
+        # accelerator/device/strategy configuration (modern Lightning replacement
+        # for the old `gpus=`/`distributed_backend=` Trainer kwargs). `gpus` itself
+        # is kept in trainer_config only so the learning-rate scaling code below
+        # (which is project logic, not a Lightning API) can keep reading it.
+        if opt.gpus is not None:
+            trainer_config["gpus"] = opt.gpus
             gpuinfo = trainer_config["gpus"]
             print(f"Running on GPUs {gpuinfo}")
+            trainer_config["accelerator"] = "gpu"
+            trainer_config["devices"] = [int(g) for g in gpuinfo.strip(",").split(",") if g != ""]
+            trainer_config["strategy"] = "ddp"
             cpu = False
+        else:
+            trainer_config["accelerator"] = "cpu"
+            trainer_config["devices"] = 1
+            cpu = True
         if opt.max_step is not None:
             trainer_config["max_steps"] = opt.max_step
-        trainer_opt = argparse.Namespace(**trainer_config)
         lightning_config.trainer = trainer_config
 
         if opt.resume:
@@ -523,7 +524,7 @@ if __name__ == "__main__":
         }
         #default_logger_cfg = default_logger_cfgs["testtube"]
         default_logger_cfg = default_logger_cfgs["wandb"]
-        logger_cfg = lightning_config.logger or OmegaConf.create()
+        logger_cfg = lightning_config.get("logger", OmegaConf.create()) or OmegaConf.create()
         logger_cfg = OmegaConf.merge(default_logger_cfg, logger_cfg)
         trainer_kwargs["logger"] = instantiate_from_config(logger_cfg)
 
@@ -545,9 +546,9 @@ if __name__ == "__main__":
             if 'loss' in model.monitor:
                 default_modelckpt_cfg["params"]["mode"] = "min"
 
-        modelckpt_cfg = lightning_config.modelcheckpoint or OmegaConf.create()
+        modelckpt_cfg = lightning_config.get("modelcheckpoint", OmegaConf.create()) or OmegaConf.create()
         modelckpt_cfg = OmegaConf.merge(default_modelckpt_cfg, modelckpt_cfg)
-        trainer_kwargs["checkpoint_callback"] = instantiate_from_config(modelckpt_cfg)
+        model_checkpoint = instantiate_from_config(modelckpt_cfg)
 
         # add callback which sets up log directory
         default_callbacks_cfg = {
@@ -589,11 +590,13 @@ if __name__ == "__main__":
                 }
             }
 
-        callbacks_cfg = lightning_config.callbacks or OmegaConf.create()
+        callbacks_cfg = lightning_config.get("callbacks", OmegaConf.create()) or OmegaConf.create()
         callbacks_cfg = OmegaConf.merge(default_callbacks_cfg, callbacks_cfg)
         trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
-        trainer_kwargs["progress_bar_refresh_rate"] = 0
-        trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
+        trainer_kwargs["callbacks"].append(model_checkpoint)
+        trainer_kwargs["enable_progress_bar"] = False
+        trainer_init_kwargs = {k: v for k, v in trainer_config.items() if k != "gpus"}
+        trainer = Trainer(**trainer_init_kwargs, **trainer_kwargs)
 
         # data
         data = instantiate_from_config(config.data)
@@ -609,7 +612,7 @@ if __name__ == "__main__":
             ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
         else:
             ngpu = 1
-        accumulate_grad_batches = lightning_config.trainer.accumulate_grad_batches or 1
+        accumulate_grad_batches = lightning_config.trainer.get("accumulate_grad_batches", 1) or 1
         print(f"accumulate_grad_batches = {accumulate_grad_batches}")
         lightning_config.trainer.accumulate_grad_batches = accumulate_grad_batches
         model.learning_rate = accumulate_grad_batches * ngpu * bs * base_lr
@@ -630,8 +633,10 @@ if __name__ == "__main__":
                 pudb.set_trace()
 
         import signal
-        signal.signal(signal.SIGUSR1, melk)
-        signal.signal(signal.SIGUSR2, divein)
+        if hasattr(signal, "SIGUSR1"):
+            signal.signal(signal.SIGUSR1, melk)
+        if hasattr(signal, "SIGUSR2"):
+            signal.signal(signal.SIGUSR2, divein)
 
         # run
         if opt.train:
