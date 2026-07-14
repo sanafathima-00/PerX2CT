@@ -51,7 +51,16 @@ def load_vqgan(config, model_module, ckpt_path=None):
     model = model_module(**config.model.params)
 
     if ckpt_path is not None:
-        sd = torch.load(ckpt_path, map_location="cpu")["state_dict"]
+        # weights_only=False: this checkpoint is a PyTorch Lightning
+        # Trainer.save_checkpoint() output, which stores non-tensor callback
+        # metadata alongside the state_dict; PyTorch >=2.6 defaults
+        # torch.load to weights_only=True and rejects that metadata.
+        # Fall back to the pre-2.6 call signature if weights_only isn't
+        # supported (PyTorch <1.13).
+        try:
+            sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)["state_dict"]
+        except TypeError:
+            sd = torch.load(ckpt_path, map_location="cpu")["state_dict"]
         missing, unexpected = model.load_state_dict(sd, strict=False)
     return model.eval()
 

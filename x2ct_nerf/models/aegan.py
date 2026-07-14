@@ -64,7 +64,16 @@ class AEModel(pl.LightningModule):
         return encoder_module, decoder_module
 
     def init_from_ckpt(self, path, ignore_keys=list()):
-        sd = torch.load(path, map_location="cpu")["state_dict"]
+        # weights_only=False: this checkpoint is a PyTorch Lightning
+        # Trainer.save_checkpoint() output, which stores non-tensor callback
+        # metadata alongside the state_dict; PyTorch >=2.6 defaults
+        # torch.load to weights_only=True and rejects that metadata.
+        # Fall back to the pre-2.6 call signature if weights_only isn't
+        # supported (PyTorch <1.13).
+        try:
+            sd = torch.load(path, map_location="cpu", weights_only=False)["state_dict"]
+        except TypeError:
+            sd = torch.load(path, map_location="cpu")["state_dict"]
         keys = list(sd.keys())
         for k in keys:
             for ik in ignore_keys:
@@ -721,7 +730,12 @@ class INRAETemplateModel(AEModel):
 
         if metadata.get("decoder_weight_dir", None) is not None:
             decode_weight_dict = OrderedDict()
-            decode_weight = torch.load(metadata["decoder_weight_dir"])["state_dict"]
+            # weights_only=False: same Lightning-checkpoint-metadata reason as
+            # init_from_ckpt above; fall back if unsupported (PyTorch <1.13).
+            try:
+                decode_weight = torch.load(metadata["decoder_weight_dir"], weights_only=False)["state_dict"]
+            except TypeError:
+                decode_weight = torch.load(metadata["decoder_weight_dir"])["state_dict"]
 
             for k, v in decode_weight.items():
                 if 'decoder' in k:
