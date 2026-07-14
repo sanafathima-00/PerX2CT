@@ -14,6 +14,7 @@ the next implementation phase.
 """
 import argparse
 import math
+import os
 
 import imageio
 import numpy as np
@@ -63,6 +64,30 @@ def parse_arguments():
         choices=["cpu", "cuda"],
         help='Device to run inference on ("cpu" or "cuda"). '
         "Defaults to cuda if available, otherwise cpu.",
+    )
+    parser.add_argument(
+        "--input_pa",
+        type=str,
+        required=True,
+        help="Path to the PA X-ray image file.",
+    )
+    parser.add_argument(
+        "--input_lateral",
+        type=str,
+        default=None,
+        help="Path to the Lateral X-ray image file (optional).",
+    )
+    parser.add_argument(
+        "--axis",
+        type=str,
+        required=True,
+        help="Reconstruction axis: one of sagittal, coronal, axial.",
+    )
+    parser.add_argument(
+        "--slice_index",
+        type=int,
+        required=True,
+        help="Non-negative slice index along --axis.",
     )
     return parser.parse_args()
 
@@ -290,6 +315,13 @@ def build_batch(pa_tensor, lateral_tensor, axis, slice_index, device, ct_height=
 def main():
     opt = parse_arguments()
 
+    if not os.path.isfile(opt.input_pa):
+        raise FileNotFoundError(f"--input_pa not found: {opt.input_pa}")
+    if opt.axis not in _VALID_AXES:
+        raise ValueError(f"--axis must be one of {sorted(_VALID_AXES)}, got {opt.axis!r}")
+    if opt.slice_index < 0:
+        raise ValueError(f"--slice_index must be non-negative, got {opt.slice_index}")
+
     device = opt.device
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -307,19 +339,37 @@ def main():
     print(f"Device: {device}")
     print("Model is in eval mode and ready.")
 
-    # Preprocessing and batch-construction utilities now exist above
-    # (load_xray_image, preprocess_pa_image, preprocess_lateral_image,
-    # create_camera_tensors, create_placeholder_ct, create_file_path,
-    # build_batch), but are not yet wired into this CLI.
+    # This checkpoint's config has cond_list == [PA, Lateral] (2-view), so
+    # Lateral is required for model.log_images to succeed even though the
+    # CLI flag itself is optional.
+    if opt.input_lateral is None:
+        raise ValueError("--input_lateral is required: the loaded config's cond_list includes 'Lateral'.")
+    if not os.path.isfile(opt.input_lateral):
+        raise FileNotFoundError(f"--input_lateral not found: {opt.input_lateral}")
 
-    # TODO (next implementation phase): CLI wiring
-    #   Add arguments for the PA/Lateral image paths and the requested
-    #   axis/slice_index, then call load_xray_image + preprocess_*_image +
-    #   build_batch to construct the batch dict on `device`.
+    pa_image = load_xray_image(opt.input_pa)
+    lateral_image = load_xray_image(opt.input_lateral)
+    pa_tensor = preprocess_pa_image(pa_image)
+    lateral_tensor = preprocess_lateral_image(lateral_image)
 
-    # TODO (next implementation phase): inference / CT reconstruction
-    #   Call model.log_images(batch) (or an equivalent forward path) on the
-    #   constructed batch to produce reconstructed CT slices.
+    batch = build_batch(pa_tensor, lateral_tensor, opt.axis, opt.slice_index, device)
+
+    log = model.log_images(batch)
+
+    if not isinstance(log, dict):
+        raise RuntimeError(f"model.log_images(batch) returned {type(log).__name__}, expected dict.")
+    if "reconstructions" not in log:
+        raise RuntimeError(
+            f"model.log_images(batch) result missing 'reconstructions' key. Keys present: {list(log.keys())}"
+        )
+
+    recon = log["reconstructions"]
+    print(f"Available log keys: {list(log.keys())}")
+    print(f"Reconstruction shape: {tuple(recon.shape)}")
+    print(f"Reconstruction dtype: {recon.dtype}")
+    print(f"Reconstruction device: {recon.device}")
+    print(f"Reconstruction min: {recon.min().item()}")
+    print(f"Reconstruction max: {recon.max().item()}")
 
     # TODO (next implementation phase): output saving
     #   Persist the reconstructed slice(s) to disk (e.g. PNG/NumPy/NIfTI)
