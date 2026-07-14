@@ -85,8 +85,21 @@ def build_model(config):
 
 
 def load_checkpoint(model, checkpoint_path):
-    """Load pretrained weights via the model's own init_from_ckpt utility."""
-    model.init_from_ckpt(checkpoint_path)
+    """Load pretrained weights directly, without depending on model.init_from_ckpt.
+
+    model.init_from_ckpt still raises the PyTorch 2.6+ weights_only
+    UnpicklingError despite calling torch.load the same way; this performs
+    the load inline instead so predict.py has no dependency on it.
+    Same backward-compatible weights_only fallback used in the other
+    checkpoint-loading sites across the repository (PyTorch <1.13 lacks the
+    weights_only kwarg entirely).
+    """
+    try:
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+    model.load_state_dict(ckpt["state_dict"], strict=False)
+    print(f"Restored from {checkpoint_path}")
     return model
 
 
