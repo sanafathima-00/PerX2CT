@@ -153,7 +153,3 @@ This implementation uses code from the [official X2CT-GAN implementation](https:
   doi={10.1109/ICASSP49357.2023.10096296}
 }
 ```
-
-## Contact
-
-For questions about the original work, contact [kyungdaeun@kaist.ac.kr](mailto:kyungdaeun@kaist.ac.kr) or [bttkm@kaist.ac.kr](mailto:bttkm@kaist.ac.kr).
