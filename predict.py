@@ -16,7 +16,7 @@ import argparse
 import math
 import os
 
-import imageio
+import imageio.v2 as imageio
 import numpy as np
 import torch
 from omegaconf import OmegaConf
@@ -45,7 +45,7 @@ def parse_arguments():
         "-b",
         "--base",
         nargs="+",
-        required=True,
+        default=["configs/PerX2CT.yaml"],
         metavar="config.yaml",
         help="Path(s) to model config file(s), e.g. configs/PerX2CT.yaml. "
         "Multiple paths are merged left-to-right, same as main.py.",
@@ -54,7 +54,7 @@ def parse_arguments():
         "-c",
         "--checkpoint",
         type=str,
-        required=True,
+        default="checkpoints/PerX2CT.ckpt",
         help="Path to the pretrained .ckpt file to load.",
     )
     parser.add_argument(
@@ -68,25 +68,25 @@ def parse_arguments():
     parser.add_argument(
         "--input_pa",
         type=str,
-        required=True,
+        default="test_data/pa.png",
         help="Path to the PA X-ray image file.",
     )
     parser.add_argument(
         "--input_lateral",
         type=str,
-        default=None,
-        help="Path to the Lateral X-ray image file (optional).",
+        default="test_data/lateral.png",
+        help="Path to the Lateral X-ray image file.",
     )
     parser.add_argument(
         "--axis",
         type=str,
-        required=True,
+        default="axial",
         help="Reconstruction axis: one of sagittal, coronal, axial.",
     )
     parser.add_argument(
         "--slice_index",
         type=int,
-        required=True,
+        default=64,
         help="Non-negative slice index along --axis.",
     )
     return parser.parse_args()
@@ -163,7 +163,12 @@ def preprocess_pa_image(image):
         float32 torch tensor, shape (H, W, 3), values in [0, 1] -- channel-last,
         matching a single dataset item's output before batch collation.
     """
-    assert image.ndim == 2, f"expected a 2D grayscale X-ray image, got shape {image.shape}"
+    if image.ndim == 3:
+        image = image[..., 0]
+    elif image.ndim != 2:
+        raise ValueError(
+            f"expected a 2D grayscale or 3D RGB X-ray image, got shape {image.shape}"
+        )
     image = np.fliplr(image)
     image = np.expand_dims(image, -1)
     image = np.concatenate((image, image, image), axis=-1)
@@ -186,7 +191,12 @@ def preprocess_lateral_image(image):
         values in [0, 1] -- channel-last, matching a single dataset item's
         output before batch collation.
     """
-    assert image.ndim == 2, f"expected a 2D grayscale X-ray image, got shape {image.shape}"
+    if image.ndim == 3:
+        image = image[..., 0]
+    elif image.ndim != 2:
+        raise ValueError(
+            f"expected a 2D grayscale or 3D RGB X-ray image, got shape {image.shape}"
+        )
     image = np.transpose(image, (1, 0))
     image = np.flipud(image)
     image = np.expand_dims(image, -1)
@@ -266,8 +276,8 @@ def create_file_path(axis, slice_index):
     """
     if axis not in _VALID_AXES:
         raise ValueError(f"axis must be one of {sorted(_VALID_AXES)}, got {axis!r}")
-    if not isinstance(slice_index, int) or slice_index < 0:
-        raise ValueError(f"slice_index must be a non-negative int, got {slice_index!r}")
+    if not isinstance(slice_index, int) or not 0 <= slice_index < 128:
+        raise ValueError(f"slice_index must be between 0 and 127, got {slice_index}")
     return f"{axis}_{slice_index:03d}.h5"
 
 
@@ -315,8 +325,8 @@ def build_batch(pa_tensor, lateral_tensor, axis, slice_index, device, ct_height=
 def main():
     opt = parse_arguments()
 
-    if not os.path.isfile(opt.input_pa):
-        raise FileNotFoundError(f"--input_pa not found: {opt.input_pa}")
+    if not os.path.isfile(opt.checkpoint):
+        raise RuntimeError(f"Checkpoint not found: {opt.checkpoint}")
     if opt.axis not in _VALID_AXES:
         raise ValueError(f"--axis must be one of {sorted(_VALID_AXES)}, got {opt.axis!r}")
     if opt.slice_index < 0:
@@ -326,9 +336,18 @@ def main():
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
+    if device.type != "cuda":
+        raise RuntimeError(
+            "PerX2CT currently requires a CUDA-enabled GPU because the repository still contains "
+            "hardcoded .cuda() calls. CPU inference will be supported after the Phase 7 "
+            "device-agnostic refactor."
+        )
 
+    print("Loading configuration...")
     config = load_configuration(opt.base)
+    print("Building model...")
     model = build_model(config)
+    print("Loading checkpoint...")
     model = load_checkpoint(model, opt.checkpoint)
 
     model = model.to(device)
@@ -339,21 +358,25 @@ def main():
     print(f"Device: {device}")
     print("Model is in eval mode and ready.")
 
-    # This checkpoint's config has cond_list == [PA, Lateral] (2-view), so
-    # Lateral is required for model.log_images to succeed even though the
-    # CLI flag itself is optional.
-    if opt.input_lateral is None:
-        raise ValueError("--input_lateral is required: the loaded config's cond_list includes 'Lateral'.")
+    if not os.path.isfile(opt.input_pa):
+        raise RuntimeError(f"PA X-ray image not found: {opt.input_pa}")
     if not os.path.isfile(opt.input_lateral):
-        raise FileNotFoundError(f"--input_lateral not found: {opt.input_lateral}")
+        raise RuntimeError(f"Lateral X-ray image not found: {opt.input_lateral}")
 
+    print("Loading PA image...")
     pa_image = load_xray_image(opt.input_pa)
+
+    print("Loading Lateral image...")
     lateral_image = load_xray_image(opt.input_lateral)
+
+    print("Preprocessing...")
     pa_tensor = preprocess_pa_image(pa_image)
     lateral_tensor = preprocess_lateral_image(lateral_image)
 
+    print("Building inference batch...")
     batch = build_batch(pa_tensor, lateral_tensor, opt.axis, opt.slice_index, device)
 
+    print("Running inference...")
     log = model.log_images(batch)
 
     if not isinstance(log, dict):
@@ -364,6 +387,21 @@ def main():
         )
 
     recon = log["reconstructions"]
+    if not isinstance(recon, torch.Tensor):
+        raise RuntimeError(
+            f"model.log_images(batch) returned 'reconstructions' as {type(recon).__name__}, "
+            "expected torch.Tensor."
+        )
+    if recon.ndim != 4:
+        raise RuntimeError(
+            f"model.log_images(batch) returned 'reconstructions' with {recon.ndim} dimensions, "
+            "expected (B, C, H, W)."
+        )
+    if recon.shape[1] != 3:
+        raise RuntimeError(
+            f"model.log_images(batch) returned 'reconstructions' with {recon.shape[1]} channels, "
+            "expected 3."
+        )
     print(f"Available log keys: {list(log.keys())}")
     print(f"Reconstruction shape: {tuple(recon.shape)}")
     print(f"Reconstruction dtype: {recon.dtype}")
@@ -371,9 +409,23 @@ def main():
     print(f"Reconstruction min: {recon.min().item()}")
     print(f"Reconstruction max: {recon.max().item()}")
 
-    # TODO (next implementation phase): output saving
-    #   Persist the reconstructed slice(s) to disk (e.g. PNG/NumPy/NIfTI)
-    #   at a user-specified output location.
+    reconstruction_image = recon[0, 1].detach().cpu().numpy()
+    reconstruction_min = reconstruction_image.min()
+    reconstruction_max = reconstruction_image.max()
+    if reconstruction_max > reconstruction_min:
+        reconstruction_image = (reconstruction_image - reconstruction_min) / (
+            reconstruction_max - reconstruction_min
+        )
+    else:
+        reconstruction_image = np.zeros_like(reconstruction_image)
+    reconstruction_image = (reconstruction_image * 255).astype(np.uint8)
+
+    output_path = f"outputs/{opt.axis}_{opt.slice_index:03d}.png"
+    print("Saving reconstruction...")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    imageio.imwrite(output_path, reconstruction_image)
+    print(f"Reconstruction saved to {output_path}")
+    print("Done.")
 
 
 if __name__ == "__main__":

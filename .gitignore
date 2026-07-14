@@ -1,6 +1,7 @@
 # Patient/clinical data -- never commit (see data-governance note; contains
 # real, patient-identifiable DICOM exports)
 sample_data/
+test_data/
 
 # Preprocessed / raw datasets (LIDC-IDRI and similar) -- large binary data,
 # not source

@@ -1,102 +1,159 @@
-# Perspective Projection-Based 3D CT Reconstruction from Biplanar X-rays
-<b> <a href="https://arxiv.org/abs/2303.05297"> Perspective Projection-Based 3D CT Reconstruction from Biplanar X-rays </a> </b> 
-<br>
-<a href="https://dek924.github.io/"> Daeun Kyung*</a>,
-<a href="https://www.linkedin.com/in/kyungmin-jo-931264181/?originalSubdomain=kr/"> Kyungmin Jo*</a>,
-<a href="https://sites.google.com/site/jaegulchoo/"> Jaegul Choo</a>,
-<a href="http://www.joonseok.net/home.html"> Joonseok Lee</a>,
-<a href="https://mp2893.com/"> Edward Choi</a>
-<br>
-<a href="https://2023.ieeeicassp.org/"> ICASSP 2023 (Best Student Paper Awards) </a>
-<br> X-ray computed tomography (CT) is one of the most common imaging techniques used to diagnose various diseases in the medical field. Its high contrast sensitivity and spatial resolution allow the physician to observe details of body parts such as bones, soft tissue, blood vessels, etc. As it involves potentially harmful radiation exposure to patients and surgeons, however, reconstructing 3D CT volume from perpendicular 2D X-ray images is considered a promising alternative, thanks to its lower radiation risk and better accessibility. This is highly challenging though, since it requires reconstruction of 3D anatomical information from 2D images with limited views, where all the information is overlapped. In this paper, we propose PerX2CT, a novel CT reconstruction framework from X-ray that reflects the perspective projection scheme. Our proposed method provides a different combination of features for each coordinate which implicitly allows the model to obtain information about the 3D location. We reveal the potential to reconstruct the selected part of CT with high resolution by properly using the coordinate-wise local and global features. Our approach shows potential for use in clinical applications with low computational complexity and fast inference time, demonstrating superior performance than baselines in multiple evaluation metrics.
-<br>
-<img src="model.png"> 
+# PerX2CT
 
+PerX2CT reconstructs a selected 2D CT slice from paired PA and lateral X-ray images. It implements the perspective-projection method described in [Perspective Projection-Based 3D CT Reconstruction from Biplanar X-rays](https://arxiv.org/abs/2303.05297) (ICASSP 2023 Best Student Paper Award).
 
-## Environment
-### Setup
-Clone the repository and navigate into the directory:
+> This repository is research code. The standalone predictor creates one reconstructed slice for visualization; it does not generate a full CT volume or a clinical DICOM/NIfTI result.
+
+![PerX2CT architecture](model.png)
+
+## What is in this repository?
+
+| Path | Purpose |
+| --- | --- |
+| `predict.py` | Standalone single-slice inference from `test_data/pa.png` and `test_data/lateral.png`. |
+| `main.py` | Training entry point and shared configuration/model-instantiation utilities. |
+| `main_test.py` | Dataset-based full-frame evaluation. |
+| `main_test_zoom.py` | Dataset-based zoom-in evaluation. |
+| `configs/` | YAML model and experiment configurations. |
+| `checkpoints/` | Place downloaded pretrained weights here. |
+| `test_data/` | Input location for standalone PA and lateral X-rays. |
+| `outputs/` | Created by `predict.py` for reconstructed PNGs. |
+| `x2ct_nerf/` | Model, projection, data, and loss implementation. |
+| `taming/` | Decoder and supporting model components. |
+| `data_preprocessing/` | Dataset preparation documentation and utilities. |
+| `dataset_list/` | Dataset split/list files used by training and evaluation. |
+
+## Requirements
+
+- Python 3.8 (the repository's pinned environment target)
+- NVIDIA GPU with CUDA support
+- A compatible CUDA-enabled PyTorch installation
+
+GPU execution is required for the current standalone predictor. Parts of the repository still contain hardcoded `.cuda()` calls, so CPU inference is intentionally rejected with a clear error.
+
+## Setup
+
+Clone the repository and create the expected Python environment:
+
+```bash
+git clone https://github.com/dek924/PerX2CT.git
+cd PerX2CT
+
+conda create -n perx2ct python=3.8
+conda activate perx2ct
+pip install --upgrade pip
+pip install torch==1.8.1+cu111 torchvision==0.9.1+cu111 torchaudio==0.8.1 \
+  -f https://download.pytorch.org/whl/torch_stable.html
+pip install -r requirement.txt
 ```
-$ git clone https://github.com/dek924/PerX2CT.git
-$ cd PerX2CT
+
+The pinned dependencies are from the original project. If a newer CUDA, PyTorch, or Python version is needed, validate training and inference before relying on it.
+
+## Pretrained checkpoint
+
+Download the pretrained weights from [Hugging Face](https://huggingface.co/KAISTEdlab/PerX2CT), then place the standard checkpoint here:
+
+```text
+checkpoints/PerX2CT.ckpt
 ```
 
-### Install requirements
-Create a conda environment, activate it, and install the required packages:
-```
-$ conda create -n perx2ct python=3.8
-$ conda activate perx2ct
-$ pip install --upgrade pip
-$ pip install torch==1.8.1+cu111 torchvision==0.9.1+cu111 torchaudio==0.8.1 -f https://download.pytorch.org/whl/torch_stable.html
-$ pip install -r requirement.txt
+`configs/PerX2CT.yaml` is the matching configuration for that checkpoint. Use `configs/PerX2CT_global_w_zoomin.yaml` only with the corresponding global/zoom-in checkpoint.
+
+## Quick start: reconstruct one slice from two X-rays
+
+1. Put a PA X-ray at `test_data/pa.png`.
+2. Put a lateral X-ray at `test_data/lateral.png`.
+3. Run:
+
+```bash
+python predict.py
 ```
 
-## Download
-### Dataset
-- We are currently utilizing the <a href="https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3041807/">LIDC-IDRI</a> dataset. You can download the original dataset <a href="https://wiki.cancerimagingarchive.net/pages/viewpage.action?pageId=1966254">here</a>. 
-Follow the instructions in [prepare_datasets.md](data_preprocessing/prepare_datasets.md) to preprocess the dataset.
+The default request reconstructs axial slice 64 and saves:
 
-### Pretrained Model
-- We've provided the pretrained weights used for our paper's experiments. You can download these weights <a href="https://huggingface.co/KAISTEdlab/PerX2CT">here</a>.  <br /><br />
+```text
+outputs/axial_064.png
+```
+
+The predictor accepts grayscale PNGs and RGB PNGs that visually contain grayscale X-rays. For RGB inputs, it uses the first channel.
+
+### Standalone predictor options
+
+```bash
+python predict.py \
+  --checkpoint checkpoints/PerX2CT.ckpt \
+  --input_pa test_data/pa.png \
+  --input_lateral test_data/lateral.png \
+  --axis axial \
+  --slice_index 64 \
+  --device cuda
+```
+
+Supported axes are `axial`, `coronal`, and `sagittal`. Output names use the selected axis and zero-padded slice index, for example `outputs/coronal_031.png`.
+
+The predictor reports the reconstruction tensor's shape, dtype, device, and value range. PNG normalization is only for visualization; it does not alter the tensor returned by the model.
 
 ## Training
-To train PerX2CT, run `main.py` with the hyper-parameters provided below:
+
+Training requires a prepared LIDC-IDRI dataset and valid dataset-list paths. See [dataset preparation](data_preprocessing/prepare_datasets.md) before starting.
+
+```bash
+python main.py --train True --gpus <gpu_ids> --name <experiment_name> --base configs/PerX2CT.yaml
 ```
-python main.py --train True --gpus <gpu_ids> --name <exp_name> --base <path_to_base_config>
+
+## Dataset-based evaluation
+
+Use these scripts when evaluating against configured dataset splits rather than manually supplied X-rays:
+
+```bash
+python main_test.py \
+  --ckpt_path checkpoints/PerX2CT.ckpt \
+  --config_path configs/PerX2CT.yaml \
+  --save_dir <results_directory> \
+  --val_test test
 ```
-**Note**: The hyperparameters used in our paper's experiments are set as default. <br />
-**Note**: The configuration for training the PerX2CT model without zoom-in is `configs/PerX2CT.yaml`, while the configuration for training the PerX2CT<sub>global</sub> model with zoom-in is `configs/PerX2CT_global_w_zoomin.yaml`. <br /><br />
 
-## Evaluation
-### Full frame evaluation (default)
-To evaluate PerX2CT, use the following commands depending on the type of checkpoint (ckpt) you're working with:
+For zoom-in evaluation, use the global model/checkpoint pair:
 
-- For evaluating your own experiments:
-  ```
-  python main_test.py --ckpt_name <checkpoint_name> --save_dir <experiment_dir> --val_test <target_test_set (val or test)>
-  ```
+```bash
+python main_test_zoom.py \
+  --ckpt_path <global_checkpoint> \
+  --config_path configs/PerX2CT_global_w_zoomin.yaml \
+  --save_dir <results_directory> \
+  --zoom_size <patch_size>
+```
 
-- For evaluating our pre-trained checkpoints (or any other specific ckpt):
-  ```
-  python main_test.py --ckpt_path <checkpoint_path> --save_dir <save_dir> --config_path <config_path> --val_test <target_test_set (val or test)>
-  ```
-  **Note**: Using the configuration `configs/PerX2CT.yaml` for `PerX2CT.ckpt`, while the configuration for `PerX2CT_global.ckpt` is `configs/PerX2CT_global_w_zoomin.yaml`.
+## Common issues
 
+| Symptom | Check |
+| --- | --- |
+| `Checkpoint not found` | Confirm `checkpoints/PerX2CT.ckpt` exists or pass `--checkpoint`. |
+| PA/lateral image not found | Confirm the filenames in `test_data/` or pass `--input_pa` and `--input_lateral`. |
+| CPU/CUDA error | Use a CUDA-enabled PyTorch environment and run with `--device cuda`; CPU inference is not supported yet. |
+| Unexpected image dimensions | Supply a 2D grayscale image or a 3D RGB image. |
+| Out-of-memory error | This model is GPU-intensive; use a GPU with more memory or investigate model/runtime settings before changing architecture code. |
 
-### Zoom-in frame evaluation (subgoal)
-To evaluate PerX2CT for zoom-in task, using the following commands depending on the type of checkpoint (ckpt) you're working with:
-- For evaluating your own experiments:
-  ```
-  python main_test_zoom.py --ckpt_name <checkpoint_name> --save_dir <checkpoint_dir> --zoom_size <target_zoomin_patch_size>
-  ```
+## Data
 
-- For evaluating our pre-trained checkpoints (or any other specific ckpt):
-  ```
-  python main_test_zoom.py --ckpt_path <checkpoint_path> --save_dir <save_dir> --config_path <config_path> --zoom_size <target_zoomin_patch_size>
-  ```
-  **Note**: Use the same configuration as mentioned in the full frame evaluation section. <br /><br />
-
+The original experiments use the [LIDC-IDRI dataset](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3041807/), available through [The Cancer Imaging Archive](https://wiki.cancerimagingarchive.net/pages/viewpage.action?pageId=1966254). Follow [prepare_datasets.md](data_preprocessing/prepare_datasets.md) to prepare it for training or evaluation.
 
 ## Acknowledgements
-This implementation uses code from following repositories:
-- [Official X2CT-GAN implementation](https://github.com/kylekma/X2CT)
-- [Official Taming Transformers implementation](https://github.com/CompVis/taming-transformers)
 
-We thank the authors for their open-sourced code. <br /><br />
-
+This implementation uses code from the [official X2CT-GAN implementation](https://github.com/kylekma/X2CT) and [Taming Transformers](https://github.com/CompVis/taming-transformers).
 
 ## Citation
-```
+
+```bibtex
 @INPROCEEDINGS{kyung2023perx2ct,
   author={Kyung, Daeun and Jo, Kyungmin and Choo, Jaegul and Lee, Joonseok and Choi, Edward},
-  booktitle={ICASSP 2023 - 2023 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)}, 
-  title={Perspective Projection-Based 3d CT Reconstruction from Biplanar X-Rays}, 
+  booktitle={ICASSP 2023 - 2023 IEEE International Conference on Acoustics, Speech, and Signal Processing},
+  title={Perspective Projection-Based 3D CT Reconstruction from Biplanar X-Rays},
   year={2023},
-  volume={},
-  number={},
   pages={1-5},
-  doi={10.1109/ICASSP49357.2023.10096296}}
+  doi={10.1109/ICASSP49357.2023.10096296}
+}
 ```
 
 ## Contact
-For any questions or concerns regarding this code, please contact to us ([kyungdaeun@kaist.ac.kr](mailto:kyungdaeun@kaist.ac.kr) or [bttkm@kaist.ac.kr](mailto:bttkm@kaist.ac.kr)).
+
+For questions about the original work, contact [kyungdaeun@kaist.ac.kr](mailto:kyungdaeun@kaist.ac.kr) or [bttkm@kaist.ac.kr](mailto:bttkm@kaist.ac.kr).
