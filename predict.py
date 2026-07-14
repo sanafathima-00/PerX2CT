@@ -185,6 +185,22 @@ def load_xray_image(path, target_size=None):
     return image
 
 
+def get_ct_res(config):
+    """Read the number of slices per axis (input_ct_res) from the loaded config.
+
+    Authoritative source (traced in Phase 6.3A): configs/*.yaml's top-level
+    `input_ct_res`, resolved into `encoder_params.params.ct_res` -- the same
+    value INREncoderZoomAxisInAlign builds its 128-position query grid from
+    (INREncoderZoomAxisInAlign.py: self.ct_res = torch.tensor([ct_res] * 3)),
+    and the same value main_test.py/main_test_zoom.py use to set the
+    DataLoader batch size when reconstructing a complete per-axis series
+    (config['data']['params']['batch_size'] = config['input_ct_res']).
+    Read from the already-loaded config rather than hardcoded, so a
+    different config's slice count is picked up automatically.
+    """
+    return int(config.input_ct_res)
+
+
 def get_xray_target_size(config):
     """Read the square X-ray target resolution from the loaded config.
 
@@ -313,7 +329,7 @@ def create_placeholder_ct(batch_size, height, width, device):
     return torch.zeros((batch_size, height, width, 3), dtype=torch.float32, device=device)
 
 
-def create_file_path(axis, slice_index):
+def create_file_path(axis, slice_index, input_ct_res):
     """Generate the file_path_ string the encoder's parser expects.
 
     Traced from get_rays_for_no_rendering:
@@ -324,15 +340,21 @@ def create_file_path(axis, slice_index):
     an axis name and an integer slice index -- e.g. "coronal_104.h5", the
     exact form seen in the dataset's own path comment
     (x2ct_nerf/data/base.py, __getitem__).
+
+    Args:
+        input_ct_res: valid slice_index upper bound (exclusive), read from
+            the loaded config via get_ct_res -- the same value the whole-series
+            reconstruction loop in main() uses, so validation here can never
+            drift from what the loop actually iterates.
     """
     if axis not in _VALID_AXES:
         raise ValueError(f"axis must be one of {sorted(_VALID_AXES)}, got {axis!r}")
-    if not isinstance(slice_index, int) or not 0 <= slice_index < 128:
-        raise ValueError(f"slice_index must be between 0 and 127, got {slice_index}")
+    if not isinstance(slice_index, int) or not 0 <= slice_index < input_ct_res:
+        raise ValueError(f"slice_index must be between 0 and {input_ct_res - 1}, got {slice_index}")
     return f"{axis}_{slice_index:03d}.h5"
 
 
-def build_batch(pa_tensor, lateral_tensor, axis, slice_index, device, ct_height=128, ct_width=128):
+def build_batch(pa_tensor, lateral_tensor, axis, slice_index, device, input_ct_res, ct_height=128, ct_width=128):
     """Assemble the complete batch dictionary expected by model.log_images().
 
     Note: "image_key" is intentionally NOT included here. Tracing
@@ -348,6 +370,8 @@ def build_batch(pa_tensor, lateral_tensor, axis, slice_index, device, ct_height=
         axis: one of "sagittal", "coronal", "axial".
         slice_index: non-negative int slice index along `axis`.
         device: torch.device (or device string) all tensors are placed on.
+        input_ct_res: forwarded to create_file_path's slice_index bounds check
+            (see get_ct_res).
         ct_height, ct_width: spatial size of the placeholder ctslice tensor
             (see create_placeholder_ct's docstring for why 128 is recommended).
 
@@ -361,7 +385,7 @@ def build_batch(pa_tensor, lateral_tensor, axis, slice_index, device, ct_height=
     lateral = lateral_tensor.unsqueeze(0).to(device)
     pa_cam, lateral_cam = create_camera_tensors(batch_size, device)
     ctslice = create_placeholder_ct(batch_size, ct_height, ct_width, device)
-    file_path_ = [create_file_path(axis, slice_index)]
+    file_path_ = [create_file_path(axis, slice_index, input_ct_res)]
 
     return {
         "PA": pa,
@@ -432,59 +456,64 @@ def main():
     print(f"PA tensor shape: {tuple(pa_tensor.shape)}")
     print(f"Lateral tensor shape: {tuple(lateral_tensor.shape)}")
 
-    print("Building inference batch...")
-    batch = build_batch(pa_tensor, lateral_tensor, opt.axis, opt.slice_index, device)
+    # Repository-faithful whole-series reconstruction (Phase 6.3B): the model
+    # reconstructs exactly one slice per model.log_images() call (confirmed in
+    # Phase 6.3A), and the repository's own evaluation scripts
+    # (main_test.py/main_test_zoom.py) assemble a complete per-axis series by
+    # looping slice_index from 0 to input_ct_res-1 while holding PA, Lateral,
+    # and the camera tensors fixed. input_ct_res is read from the loaded
+    # config (get_ct_res), never hardcoded.
+    input_ct_res = get_ct_res(config)
+    output_dir = "outputs"
+    os.makedirs(output_dir, exist_ok=True)
 
-    print("Running inference...")
-    log = model.log_images(batch)
+    for slice_index in range(input_ct_res):
+        print(f"Generating slice {slice_index + 1}/{input_ct_res}")
 
-    if not isinstance(log, dict):
-        raise RuntimeError(f"model.log_images(batch) returned {type(log).__name__}, expected dict.")
-    if "reconstructions" not in log:
-        raise RuntimeError(
-            f"model.log_images(batch) result missing 'reconstructions' key. Keys present: {list(log.keys())}"
-        )
+        batch = build_batch(pa_tensor, lateral_tensor, opt.axis, slice_index, device, input_ct_res)
 
-    recon = log["reconstructions"]
-    if not isinstance(recon, torch.Tensor):
-        raise RuntimeError(
-            f"model.log_images(batch) returned 'reconstructions' as {type(recon).__name__}, "
-            "expected torch.Tensor."
-        )
-    if recon.ndim != 4:
-        raise RuntimeError(
-            f"model.log_images(batch) returned 'reconstructions' with {recon.ndim} dimensions, "
-            "expected (B, C, H, W)."
-        )
-    if recon.shape[1] != 3:
-        raise RuntimeError(
-            f"model.log_images(batch) returned 'reconstructions' with {recon.shape[1]} channels, "
-            "expected 3."
-        )
-    print(f"Available log keys: {list(log.keys())}")
-    print(f"Reconstruction shape: {tuple(recon.shape)}")
-    print(f"Reconstruction dtype: {recon.dtype}")
-    print(f"Reconstruction device: {recon.device}")
-    print(f"Reconstruction min: {recon.min().item()}")
-    print(f"Reconstruction max: {recon.max().item()}")
+        log = model.log_images(batch)
 
-    reconstruction_image = recon[0, 1].detach().cpu().numpy()
-    reconstruction_min = reconstruction_image.min()
-    reconstruction_max = reconstruction_image.max()
-    if reconstruction_max > reconstruction_min:
-        reconstruction_image = (reconstruction_image - reconstruction_min) / (
-            reconstruction_max - reconstruction_min
-        )
-    else:
-        reconstruction_image = np.zeros_like(reconstruction_image)
-    reconstruction_image = (reconstruction_image * 255).astype(np.uint8)
+        if not isinstance(log, dict):
+            raise RuntimeError(f"model.log_images(batch) returned {type(log).__name__}, expected dict.")
+        if "reconstructions" not in log:
+            raise RuntimeError(
+                f"model.log_images(batch) result missing 'reconstructions' key. Keys present: {list(log.keys())}"
+            )
 
-    output_path = f"outputs/{opt.axis}_{opt.slice_index:03d}.png"
-    print("Saving reconstruction...")
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    imageio.imwrite(output_path, reconstruction_image)
-    print(f"Reconstruction saved to {output_path}")
-    print("Done.")
+        recon = log["reconstructions"]
+        if not isinstance(recon, torch.Tensor):
+            raise RuntimeError(
+                f"model.log_images(batch) returned 'reconstructions' as {type(recon).__name__}, "
+                "expected torch.Tensor."
+            )
+        if recon.ndim != 4:
+            raise RuntimeError(
+                f"model.log_images(batch) returned 'reconstructions' with {recon.ndim} dimensions, "
+                "expected (B, C, H, W)."
+            )
+        if recon.shape[1] != 3:
+            raise RuntimeError(
+                f"model.log_images(batch) returned 'reconstructions' with {recon.shape[1]} channels, "
+                "expected 3."
+            )
+
+        reconstruction_image = recon[0, 1].detach().cpu().numpy()
+        reconstruction_min = reconstruction_image.min()
+        reconstruction_max = reconstruction_image.max()
+        if reconstruction_max > reconstruction_min:
+            reconstruction_image = (reconstruction_image - reconstruction_min) / (
+                reconstruction_max - reconstruction_min
+            )
+        else:
+            reconstruction_image = np.zeros_like(reconstruction_image)
+        reconstruction_image = (reconstruction_image * 255).astype(np.uint8)
+
+        output_path = f"{output_dir}/{opt.axis}_{slice_index:03d}.png"
+        imageio.imwrite(output_path, reconstruction_image)
+
+    print(f"Generated {input_ct_res} slices")
+    print(f"Saved to {output_dir}/")
 
 
 if __name__ == "__main__":
