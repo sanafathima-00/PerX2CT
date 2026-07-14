@@ -20,6 +20,7 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+from PIL import Image
 
 from main import instantiate_from_config
 from x2ct_nerf.preprocessing.X2CT_transform_3d import List_Compose, Normalization, ToTensor
@@ -29,6 +30,15 @@ from x2ct_nerf.preprocessing.X2CT_transform_3d import List_Compose, Normalizatio
 # instead of duplicating the Normalization/ToTensor math by hand.
 _XRAY_MIN_MAX = (0, 255)
 _XRAY_PREPROCESSING = List_Compose([(Normalization(*_XRAY_MIN_MAX),), (ToTensor(),)])
+
+# data_preprocessing/3_make_h5_dataset.py resizes with PIL's Image.ANTIALIAS,
+# which modern Pillow renamed to Image.Resampling.LANCZOS (plain Image.LANCZOS
+# on older Pillow that lacks the Resampling namespace). Same filter, restored
+# here for the standalone pipeline (Phase 6.2E/6.2F).
+try:
+    _XRAY_RESIZE_FILTER = Image.Resampling.LANCZOS
+except AttributeError:
+    _XRAY_RESIZE_FILTER = Image.LANCZOS
 
 # Axis names recognized by INREncoderZoomAxisInAlign.get_rays_for_no_rendering's
 # file_path_ parser (x2ct_nerf/modules/INREncoderZoomAxisInAlign.py). Any string
@@ -137,15 +147,56 @@ def load_checkpoint(model, checkpoint_path):
 # dataset classes, DataLoader, or dataset_list files.
 # ---------------------------------------------------------------------------
 
-def load_xray_image(path):
+def load_xray_image(path, target_size=None):
     """Load an image from disk as a numpy array.
 
     Mirrors LIDCMultiInputMultiResTypes.get_image's png branch
     (imageio.imread + np.asarray), generalized to any format imageio/PIL
     supports rather than restricted to '.png'.
+
+    Restores the offline resize step from data_preprocessing/3_make_h5_dataset.py
+    (lines 102-112), which the standalone pipeline otherwise skips: that script
+    grayscale-extracts (cv2.imread(...)[..., 0]) THEN resizes to a square
+    (xray_size, xray_size) via Image.resize(..., Image.ANTIALIAS), before the
+    dataset loader (x2ct_nerf/data/base.py) ever sees the PNG -- base.py itself
+    never resizes. Reproduced here in the same order: grayscale, then resize,
+    both applied identically to PA and Lateral before any orientation-specific
+    (fliplr/transpose) processing, which is what previously let a non-square
+    source image reach preprocess_pa_image/preprocess_lateral_image with
+    mismatched PA/Lateral shapes and fail at torch.stack(src_imgs) inside
+    INREncoderZoomAxisInAlign.forward.
+
+    Args:
+        target_size: if given, the square side length (int) to resize to,
+            using the same Image.ANTIALIAS/LANCZOS filter the offline
+            preprocessing script used. If None, no resize is performed
+            (preserves the previous behavior for already-correctly-sized
+            inputs).
     """
     image = imageio.imread(path)
-    return np.asarray(image)
+    image = np.asarray(image)
+    if image.ndim == 3:
+        image = image[..., 0]
+    elif image.ndim != 2:
+        raise ValueError(f"expected a 2D grayscale or 3D RGB X-ray image, got shape {image.shape}")
+    if target_size is not None:
+        image = Image.fromarray(image).resize((target_size, target_size), _XRAY_RESIZE_FILTER)
+        image = np.asarray(image)
+    return image
+
+
+def get_xray_target_size(config):
+    """Read the square X-ray target resolution from the loaded config.
+
+    Authoritative source (traced in Phase 6.2E): configs/*.yaml's top-level
+    `input_img_size`, which is also what cond_encoder_params.cfg.input_img_size
+    resolves to (the value ResNetEncoder/get_data_transform's own Resize uses)
+    and equals data.params.train.params.opt.xray_size (the value
+    data_preprocessing/3_make_h5_dataset.py bakes PA/Lateral PNGs to offline)
+    in every shipped config. Read from the already-loaded config rather than
+    hardcoded, so a different config's resolution is picked up automatically.
+    """
+    return int(config.input_img_size)
 
 
 def preprocess_pa_image(image):
@@ -363,15 +414,23 @@ def main():
     if not os.path.isfile(opt.input_lateral):
         raise RuntimeError(f"Lateral X-ray image not found: {opt.input_lateral}")
 
+    xray_target_size = get_xray_target_size(config)
+
     print("Loading PA image...")
-    pa_image = load_xray_image(opt.input_pa)
+    pa_image = load_xray_image(opt.input_pa, target_size=xray_target_size)
 
     print("Loading Lateral image...")
-    lateral_image = load_xray_image(opt.input_lateral)
+    lateral_image = load_xray_image(opt.input_lateral, target_size=xray_target_size)
+
+    print(f"Loaded PA shape: {pa_image.shape}")
+    print(f"Loaded Lateral shape: {lateral_image.shape}")
 
     print("Preprocessing...")
     pa_tensor = preprocess_pa_image(pa_image)
     lateral_tensor = preprocess_lateral_image(lateral_image)
+
+    print(f"PA tensor shape: {tuple(pa_tensor.shape)}")
+    print(f"Lateral tensor shape: {tuple(lateral_tensor.shape)}")
 
     print("Building inference batch...")
     batch = build_batch(pa_tensor, lateral_tensor, opt.axis, opt.slice_index, device)
