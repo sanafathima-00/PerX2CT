@@ -46,25 +46,6 @@ except AttributeError:
 # we validate against the full set here to catch typos early.
 _VALID_AXES = {"sagittal", "coronal", "axial"}
 
-# HU recovery constants (Phase 6.4A/6.4B analysis). The decoder is trained to
-# approximate clip(HU + 1024, 0, 2500) / 2500:
-#   - 2500 is CT_MIN_MAX[1] (x2ct_nerf/data/base.py's Normalization bound),
-#     identical in every shipped config's data.params.*.params.opt.CT_MIN_MAX.
-#   - 1024 is the fixed rescale shift applied in data_preprocessing/0_dicom2mhd.py
-#     ("image_pixel_array += 1024"), not a config value.
-# Recovery is exact only for HU that was never clipped by CT_MIN_MAX, i.e.
-# roughly [-1024, 1476] HU -- which fully covers both windows defined below.
-_CT_NORMALIZATION_SCALE = 2500
-_CT_HU_SHIFT = 1024
-
-# Standard radiology display windows. These are an external convention -- not
-# defined anywhere in the repository (confirmed absent in Phase 6.4B) -- so
-# they are declared here rather than read from any config.
-LUNG_WINDOW_WIDTH = 1500
-LUNG_WINDOW_LEVEL = -600
-MEDIASTINAL_WINDOW_WIDTH = 400
-MEDIASTINAL_WINDOW_LEVEL = 40
-
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
@@ -416,29 +397,6 @@ def build_batch(pa_tensor, lateral_tensor, axis, slice_index, device, input_ct_r
     }
 
 
-# ---------------------------------------------------------------------------
-# Medical CT windowing (Phase 6.4C).
-# ---------------------------------------------------------------------------
-
-def apply_window(hu_image, width, level):
-    """Apply a fixed radiology display window to an HU image.
-
-    1. lower, upper = level - width/2, level + width/2
-    2. clip hu_image into [lower, upper]
-    3. linearly map [lower, upper] -> [0, 255]
-    4. return uint8
-
-    No per-slice statistics and no auto-contrast: the mapping is fixed by
-    (width, level) alone, so absolute HU meaning is preserved across every
-    slice -- unlike the per-slice min/max normalization this replaces.
-    """
-    lower = level - width / 2
-    upper = level + width / 2
-    clipped = np.clip(hu_image, lower, upper)
-    scaled = (clipped - lower) / (upper - lower) * 255
-    return scaled.astype(np.uint8)
-
-
 def main():
     opt = parse_arguments()
 
@@ -507,10 +465,7 @@ def main():
     # config (get_ct_res), never hardcoded.
     input_ct_res = get_ct_res(config)
     output_dir = "outputs"
-    lung_dir = f"{output_dir}/lung"
-    mediastinal_dir = f"{output_dir}/mediastinal"
-    os.makedirs(lung_dir, exist_ok=True)
-    os.makedirs(mediastinal_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     for slice_index in range(input_ct_res):
         print(f"Generating slice {slice_index + 1}/{input_ct_res}")
@@ -544,22 +499,18 @@ def main():
             )
 
         reconstruction_image = recon[0, 1].detach().cpu().numpy()
+        reconstruction_min = reconstruction_image.min()
+        reconstruction_max = reconstruction_image.max()
+        if reconstruction_max > reconstruction_min:
+            reconstruction_image = (reconstruction_image - reconstruction_min) / (
+                reconstruction_max - reconstruction_min
+            )
+        else:
+            reconstruction_image = np.zeros_like(reconstruction_image)
+        reconstruction_image = (reconstruction_image * 255).astype(np.uint8)
 
-        # Recover HU (Phase 6.4A/6.4B) instead of the old per-slice min/max
-        # normalization, which discarded the absolute intensity scale.
-        hu_shifted = reconstruction_image * _CT_NORMALIZATION_SCALE
-        hu_image = hu_shifted - _CT_HU_SHIFT
-
-        lung_image = apply_window(hu_image, LUNG_WINDOW_WIDTH, LUNG_WINDOW_LEVEL)
-        mediastinal_image = apply_window(hu_image, MEDIASTINAL_WINDOW_WIDTH, MEDIASTINAL_WINDOW_LEVEL)
-
-        filename = f"{opt.axis}_{slice_index:03d}.png"
-
-        print("Saving Lung Window...")
-        imageio.imwrite(f"{lung_dir}/{filename}", lung_image)
-
-        print("Saving Mediastinal Window...")
-        imageio.imwrite(f"{mediastinal_dir}/{filename}", mediastinal_image)
+        output_path = f"{output_dir}/{opt.axis}_{slice_index:03d}.png"
+        imageio.imwrite(output_path, reconstruction_image)
 
     print(f"Generated {input_ct_res} slices")
     print(f"Saved to {output_dir}/")
