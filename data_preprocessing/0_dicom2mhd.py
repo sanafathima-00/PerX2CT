@@ -1,4 +1,5 @@
 import os
+import sys
 import SimpleITK as sitk
 import pydicom as dc
 import numpy as np
@@ -7,7 +8,26 @@ from tqdm import tqdm
 import os
 root_dir = os.path.dirname(os.path.realpath(__file__))
 
-Folders_Path = f"{root_dir}/lidc_idri/manifest-1600709154662/LIDC-IDRI/"
+lidc_idri_root = f"{root_dir}/lidc_idri"
+manifest_dirs = sorted(
+    d for d in glob.glob(f"{lidc_idri_root}/manifest-*") if os.path.isdir(d)
+)
+if len(manifest_dirs) == 0:
+    sys.exit(
+        f"No 'manifest-*' folder found under '{lidc_idri_root}'.\n"
+        "Download the LIDC-IDRI dataset via NBIA Data Retriever into this "
+        "directory first (see prepare_datasets.md) -- NBIA Data Retriever "
+        "creates a 'manifest-<timestamp>' folder automatically."
+    )
+elif len(manifest_dirs) > 1:
+    listing = "\n".join(f"  - {d}" for d in manifest_dirs)
+    sys.exit(
+        f"Multiple 'manifest-*' folders found under '{lidc_idri_root}':\n"
+        f"{listing}\n"
+        "Remove or rename all but one before running this script."
+    )
+
+Folders_Path = f"{manifest_dirs[0]}/LIDC-IDRI/"
 save_path = f"{root_dir}/lidc_idri/LIDC-IDRI-MDH"
 text_path = "/".join(save_path.split("/")[:-1])
 text_path = f"{text_path}/dicom2mhd.txt"

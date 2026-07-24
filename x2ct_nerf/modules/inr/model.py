@@ -7,6 +7,7 @@ from importlib import import_module
 import pdb
 
 from x2ct_nerf.modules import volume_rendering as vr
+from x2ct_nerf.modules.nerf.model import DummyNeRF
 
 # Model
 class PerspectiveINRNet(nn.Module):
@@ -28,6 +29,16 @@ class PerspectiveINRNet(nn.Module):
         self.nerf_input_ch = self.cfg['nerf_params']['cfg']['input_ch']
         self.output_ch = self.nerf.output_ch
 
+        # --- Experiment: bypass DummyNeRF ------------------------------------
+        # DummyNeRF is a zero-parameter identity whenever input_ch == output_ch
+        # (see x2ct_nerf/modules/nerf/model.py:26-32 -- no nn.Linear is created
+        # in that case). This flag lets forward() skip the call entirely instead
+        # of relying on DummyNeRF's own internal no-op branch. self.nerf is still
+        # constructed normally above, so module structure / state_dict keys are
+        # unaffected either way. Purely a control-flow change.
+        self.bypass_nerf = isinstance(self.nerf, DummyNeRF) and self.nerf.input_ch == self.nerf.output_ch
+        # ----------------------------------------------------------------------
+
     def get_model(self, module_name):
         module_, module_class = module_name.rsplit(".", 1)
         module_ = getattr(import_module(module_), module_class)
@@ -38,7 +49,10 @@ class PerspectiveINRNet(nn.Module):
         output : dictionary type
         """
         x = x[..., -self.nerf_input_ch:]
-        output = self.nerf(x)
+        if self.bypass_nerf:
+            output = {'outputs': x}  # bypass experiment -- identical to DummyNeRF's own no-op branch
+        else:
+            output = self.nerf(x)
         return output
 
     def encode(self, src_images, src_camposes, render_pts):
